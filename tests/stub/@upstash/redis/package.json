@@ -1,0 +1,1 @@
+{ "name": "@upstash/redis", "version": "0.0.0-local-test-stub", "type": "module", "main": "index.js", "exports": "./index.js" }

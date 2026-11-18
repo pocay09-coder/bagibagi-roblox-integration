@@ -1,7 +1,13 @@
 import { Redis } from "@upstash/redis";
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { usernameCandidate, lookupUsernames } from "../lib/roblox-users.js";
 
-// BagiBagi -> AFTERBEAT webhook, v2.1.
+// BagiBagi -> AFTERBEAT webhook, v3 (v2.1 + Gold Donation ranking).
+// v3: the donor name is treated as a Roblox USERNAME. Found -> counted for that UserId (USERNAME_MATCHED, like a
+// gift: NOT proof of who paid). Not found -> counted under the name (UNMATCHED). Roblox API down / rate-limited ->
+// counted under the name and marked PENDING; api/roblox.js retries and moves it atomically. Every valid donation is
+// counted exactly once in bb:rank (Top 50 / ROYAL), with a per-transaction ledger bb:tx:<id>.
+// Everything v2.1 wrote is still written (feed, history, bb:donors, link codes) so older readers / rollback work.
 // All writes for one transaction happen in ONE Lua script. Rules that keep it safe on Upstash Redis REST:
 //   * every key the script touches is passed in KEYS (dynamic keys are read first, then declared and re-checked
 //     inside the script); no undeclared keys, no error_reply, plain string arguments only
@@ -25,9 +31,13 @@ const UNUSED = "bb:unused"; // declared placeholder for keys a donation does not
 
 // KEYS: 1 processed  2 feed  3 feed:last  4 history  5 donors  6 avatar hash  7 code key  8 pending(uid)
 //       9 avatar user set(uid)  10 profile(name)  11 profile(donor id)  12 profile(account)  13 last link(uid)
+//       v3: 14 bb:rank  15 bb:tx:<id>  16 rank hash of the code account  17 rank hash of the matched account
+//           18 rank hash of the name  19 bb:rbx:pending
 // ARGV: 1 txId  2 member JSON prefix  3 now ms  4 amount  5 name key  6 display name  7 @username (display only)
 //       8 donor id key or ""  9 code hash or ""  10 uid read from the code key or ""  11 ttl  12 feed max
 //       13 history max  14 masked name for the link record
+//       v3: 15 match status (matched|unmatched|pending)  16 matched UserId or ""  17 username  18 display name
+//           19 rank name key  20 JSON fragment with username/displayName ("" if none)  21 username candidate
 const INGEST_SCRIPT = `
 local function typeOf(k)
   local t = redis.call('TYPE', k)
@@ -43,8 +53,8 @@ local function posInt(v, max)
   if not n or n ~= n or n <= 0 or n % 1 ~= 0 or n > max then return nil end
   return n
 end
--- 1) idempotency (also respects markers written by the old v1 webhook)
-if redis.call('EXISTS', KEYS[1]) == 1 then return {'duplicate'} end
+-- 1) idempotency (also respects markers written by the old v1 webhook; the v3 ledger never expires)
+if redis.call('EXISTS', KEYS[1]) == 1 or redis.call('EXISTS', KEYS[15]) == 1 then return {'duplicate'} end
 -- 2) validate every value and key type BEFORE the first write
 local amount = posInt(ARGV[4], 1e12)
 local now = posInt(ARGV[3], 1e14)
@@ -55,6 +65,11 @@ if not typeOk(KEYS[3], 'string') then return {'error', 'BBTYPE feed:last'} end
 if not typeOk(KEYS[4], 'list') then return {'error', 'BBTYPE history'} end
 if not typeOk(KEYS[5], 'zset') then return {'error', 'BBTYPE donors'} end
 if not typeOk(KEYS[6], 'hash') then return {'error', 'BBTYPE avatar'} end
+if not typeOk(KEYS[14], 'zset') then return {'error', 'BBTYPE rank'} end
+if not typeOk(KEYS[19], 'zset') then return {'error', 'BBTYPE pendingset'} end
+for i = 16, 18 do
+  if not typeOk(KEYS[i], 'hash') then return {'error', 'BBTYPE rankhash'} end
+end
 local last = redis.call('GET', KEYS[3])
 if last then
   last = tonumber(last)
@@ -83,12 +98,22 @@ if not typeOk(profileKey, 'hash') then return {'error', 'BBTYPE profile'} end
 local avatar = uid
 if not avatar and identity == 'donor' then avatar = redis.call('HGET', KEYS[6], donorKey) end
 if avatar and not string.match(avatar, '^%d+$') then avatar = false end
+-- v3 ranking member: legacy code account > username match > name (UNMATCHED / PENDING)
+local member, rankKey, txStatus, matchedUid
+if uid then member = 'u:' .. uid; rankKey = KEYS[16]; txStatus = 'code'; matchedUid = uid
+elseif ARGV[15] == 'matched' and string.match(ARGV[16], '^%d+$') then
+  member = 'u:' .. ARGV[16]; rankKey = KEYS[17]; txStatus = 'matched'; matchedUid = ARGV[16]
+else
+  member = 'n:' .. ARGV[19]; rankKey = KEYS[18]; txStatus = (ARGV[15] == 'pending') and 'pending' or 'unmatched'; matchedUid = false
+end
 -- 4) unique, strictly increasing feed score in commit order (ms + 0.001 steps)
 local score = now
 if score <= last then score = last + 0.001 end
 local scoreStr = string.format('%.3f', score)
 local receivedAt = string.format('%.0f', math.floor(score))
-local member = ARGV[2] .. ',"receivedAt":' .. receivedAt .. ',"robloxUserId":' .. (avatar or 'null') .. ',"identity":"' .. identity .. '"}'
+local extra = ',"match":"' .. txStatus .. '","matchedUserId":' .. (matchedUid or 'null')
+if txStatus == 'matched' then extra = extra .. ARGV[20] end
+local feedRow = ARGV[2] .. ',"receivedAt":' .. receivedAt .. ',"robloxUserId":' .. (avatar or 'null') .. ',"identity":"' .. identity .. '"' .. extra .. '}'
 local info = identity .. '|' .. ARGV[4] .. '|' .. scoreStr
 -- 5) writes. FIRST the marker (pending), LAST the marker (done).
 redis.call('SET', KEYS[1], 'pending|' .. info, 'EX', ttl)
@@ -102,12 +127,29 @@ end
 redis.call('ZINCRBY', KEYS[5], ARGV[4], donorKey)
 redis.call('HSET', profileKey, 'name', ARGV[6], 'robloxUsername', ARGV[7], 'identity', identity)
 redis.call('SET', KEYS[3], scoreStr)
-redis.call('ZADD', KEYS[2], scoreStr, member)
+redis.call('ZADD', KEYS[2], scoreStr, feedRow)
 redis.call('ZREMRANGEBYRANK', KEYS[2], 0, -(feedMax + 1))
-redis.call('LPUSH', KEYS[4], member)
+redis.call('LPUSH', KEYS[4], feedRow)
 redis.call('LTRIM', KEYS[4], 0, histMax - 1)
+-- v3 ranking + ledger (counted exactly once; PENDING can later be moved by api/roblox.js)
+redis.call('HSET', KEYS[15], 'amount', ARGV[4], 'member', member, 'status', txStatus, 'name', ARGV[6], 'cand', ARGV[21], 'at', receivedAt, 'legacy', donorKey)
+redis.call('ZINCRBY', KEYS[14], ARGV[4], member)
+if matchedUid then
+  redis.call('HSET', rankKey, 'lastName', ARGV[6])
+  if txStatus == 'matched' then
+    redis.call('HSET', rankKey, 'username', ARGV[17], 'displayName', ARGV[18], 'refreshedAt', ARGV[3], 'banned', '0')
+  else
+    redis.call('HSETNX', rankKey, 'refreshedAt', '0')
+  end
+else
+  redis.call('HSET', rankKey, 'name', ARGV[6])
+  if txStatus == 'pending' then
+    redis.call('HINCRBY', rankKey, 'pending', 1)
+    redis.call('ZADD', KEYS[19], now, ARGV[1])
+  end
+end
 redis.call('SET', KEYS[1], 'done|' .. info, 'EX', ttl)
-return {'accepted', identity, avatar and 'linked' or 'none'}
+return {'accepted', identity, txStatus}
 `;
 
 function reply(res, status, data) {
@@ -200,6 +242,11 @@ export default async function handler(req, res) {
     return reply(res, 400, { error: "Invalid transaction fields" });
   }
 
+  // a staging smoke test must never write into production (defence in depth: production uses other secrets too)
+  if (process.env.VERCEL_ENV === "production" && /^smoke-/i.test(transactionId)) {
+    return reply(res, 200, { ok: true, ignored: "test transaction" });
+  }
+
   const codeHash = linkCodeHash(rawMessage);
   const message = rawMessage.replace(CODE_TOKEN_ALL, " ").replace(/\s+/g, " ").trim();
   // display only; AFTERBEAT never uses @username as proof of account ownership
@@ -207,6 +254,23 @@ export default async function handler(req, res) {
   const robloxUsername = usernameMatch ? usernameMatch[1] : "";
   const nameKey = Buffer.from(donorName.toLowerCase(), "utf8").toString("base64url");
   const donorKeyId = stableDonorKey(body);
+
+  // v3: name -> Roblox username (never DisplayName). Any problem = PENDING, the donation is still counted.
+  const rankName = Buffer.from(donorName.normalize("NFC").trim().replace(/\s+/g, " ").toLowerCase(), "utf8").toString("base64url");
+  const cand = process.env.USERNAME_MATCH === "1" ? usernameCandidate(donorName) : null;
+  let match = { status: "unmatched", id: "", name: "", displayName: "" };
+  if (cand) {
+    try {
+      const found = (await lookupUsernames(redis, [cand])).get(cand.toLowerCase());
+      if (found === undefined) match.status = "pending";
+      else if (found) match = { status: "matched", id: String(found.id), name: found.name, displayName: found.displayName };
+    } catch {
+      match.status = "pending";
+    }
+  }
+  const matchFragment = match.status === "matched"
+    ? `,"username":${JSON.stringify(match.name)},"displayName":${JSON.stringify(match.displayName)}`
+    : "";
 
   // receivedAt / robloxUserId / identity are added inside the script (atomic, commit order)
   const memberPrefix = JSON.stringify({
@@ -235,11 +299,16 @@ export default async function handler(req, res) {
         `bb:donor:${nameKey}`,
         donorKeyId ? `bb:donor:${donorKeyId}` : `${UNUSED}:profile:donor`,
         candidate ? `bb:donor:uid:${candidate}` : `${UNUSED}:profile:account`,
-        candidate ? `bb:link:last:${candidate}` : `${UNUSED}:lastlink`
+        candidate ? `bb:link:last:${candidate}` : `${UNUSED}:lastlink`,
+        "bb:rank", `bb:tx:${transactionId}`,
+        candidate ? `bb:rk:u:${candidate}` : `${UNUSED}:rk:code`,
+        match.status === "matched" ? `bb:rk:u:${match.id}` : `${UNUSED}:rk:match`,
+        `bb:rk:n:${rankName}`, "bb:rbx:pending"
       ],
       [
         transactionId, memberPrefix, String(Date.now()), String(amount), nameKey, donorName, robloxUsername,
-        donorKeyId, codeHash, candidate, String(PROCESSED_TTL), String(FEED_MAX), String(HISTORY_MAX), maskName(donorName)
+        donorKeyId, codeHash, candidate, String(PROCESSED_TTL), String(FEED_MAX), String(HISTORY_MAX), maskName(donorName),
+        match.status, match.id, match.name, match.displayName, rankName, matchFragment, cand ? cand.toLowerCase() : ""
       ]
     );
     const status = Array.isArray(result) ? String(result[0]) : String(result);
