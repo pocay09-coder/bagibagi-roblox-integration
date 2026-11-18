@@ -41,7 +41,11 @@ const ledgerSum = new Map();
 const pendingPerMember = new Map();
 let ledgerRows = 0, ledgerPending = 0;
 for (const k of await scanAll("bb:tx:*")) {
-  const h = await redis.hgetall(k);
+  const raw = await redis.hgetall(k);
+const h = Array.isArray(raw) ? Object.fromEntries(
+  Array.from({ length: Math.floor(raw.length / 2) },
+    (_, i) => [String(raw[i * 2]), raw[i * 2 + 1]])
+) : raw;
   if (!h) continue;
   ledgerRows++;
   const amt = Number(h.amount) || 0;
