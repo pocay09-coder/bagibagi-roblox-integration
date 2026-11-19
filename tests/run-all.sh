@@ -25,6 +25,7 @@ run "1/7 main suite v2.1 behaviour on v3 code (expected 84 passed, 0 failed)" no
 run "2/7 v3 Gold Donation: username, Top 50, ROYAL, PENDING (expected 47 passed, 0 failed)" node run-tests-v3.mjs
 run "3/7 rollback v1 <-> v3 (expected 7 passed, 0 failed)" node rollback-test.mjs
 run "4/7 migration report is read-only (expected 10 passed, 0 failed)" node migration-test.mjs
+run "+ historical Gold migration: dry-run, exactly once, duplicates, failures, rollback (expected 50 passed, 0 failed)" node migration-historical-test.mjs
 redis-server --port 6391 --save "" --appendonly no --daemonize yes >/dev/null; sleep 0.5
 node local-server.mjs > server.log 2>&1 & SRV=$!
 LOCAL_PORT=8788 LOCAL_FAKE_API_PORT=8897 LOCAL_PRETEND_ENV=production node local-server.mjs > server2.log 2>&1 & SRV2=$!
