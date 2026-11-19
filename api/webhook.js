@@ -208,6 +208,42 @@ function maskName(name) {
   return chars.length ? chars.slice(0, 2).join("") + "***" : "***";
 }
 
+// ===== TEST webhooks (v3.1) =====
+// A signed webhook marked as a test ("test": true / "is_test": true / "isTest": true, or - outside production only -
+// transaction_id "test-...")
+// is NOT a donation: it is kept for 15 minutes in bb:testfeed only, so Roblox can play the full alert once with a
+// [TEST] label. It never touches bb:processed, bb:tx, bb:rank, bb:donors, bb:history, bb:feed or link codes.
+// Production ignores test webhooks unless ALLOW_TEST_WEBHOOKS=1.
+const TEST_TTL_SECONDS = 15 * 60;
+const TEST_MAX = 50;
+const TEST_SCRIPT = `
+local function typeOf(k) local t = redis.call('TYPE', k) if type(t) == 'table' then t = t.ok or t['ok'] end return t end
+local t1, t2 = typeOf(KEYS[1]), typeOf(KEYS[2])
+if (t1 ~= 'zset' and t1 ~= 'none') or (t2 ~= 'string' and t2 ~= 'none') then return {'error'} end
+if redis.call('EXISTS', KEYS[2]) == 1 then return {'duplicate'} end
+redis.call('SET', KEYS[2], '1', 'EX', ARGV[3])
+redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', '(' .. ARGV[4])
+redis.call('ZREMRANGEBYRANK', KEYS[1], 0, -(tonumber(ARGV[5]) + 1))
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+return {'accepted'}
+`;
+export function isTestWebhook(body, transactionId) {
+  if (body.test === true || body.is_test === true || body.isTest === true) return true;
+  // the "test-" id prefix only counts outside production: a real BagiBagi id can never be dropped from the ranking
+  return process.env.VERCEL_ENV !== "production" && /^test-/i.test(String(transactionId || ""));
+}
+
+// GROSS amount (before the BagiBagi fee). Default field "amount"; AMOUNT_FIELD can name another top-level field (or
+// a dotted path like "data.gross_amount") once a real webhook shows which field is the gross amount.
+export function grossAmount(body) {
+  const field = /^[A-Za-z0-9_]{1,40}(\.[A-Za-z0-9_]{1,40}){0,2}$/.test(process.env.AMOUNT_FIELD || "") ? process.env.AMOUNT_FIELD : "amount";
+  let v = body;
+  for (const part of field.split(".")) v = v && typeof v === "object" ? v[part] : undefined;
+  if (typeof v === "string" && /^\d{1,13}(\.0+)?$/.test(v.trim())) v = Number(v.trim());
+  return typeof v === "number" ? v : NaN;
+}
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -231,11 +267,16 @@ export default async function handler(req, res) {
 
   if (process.env.LOG_WEBHOOK_KEYS === "1") {
     console.log("BagiBagi webhook keys:", Object.keys(body).sort().join(","));
+    // numbers of amount-like fields only (never names, messages or ids): shows which field is the GROSS amount
+    const nums = Object.entries(body)
+      .filter(([k, v]) => /amount|total|gross|net|fee|nominal|price/i.test(k) && (typeof v === "number" || /^\d{1,13}(\.\d+)?$/.test(String(v))))
+      .map(([k, v]) => `${k}=${v}`);
+    if (nums.length) console.log("BagiBagi webhook amount fields:", nums.join(","));
   }
 
   const transactionId = cleanText(body.transaction_id, 120);
   const donorName = cleanText(body.name, 40) || "Donatur";
-  const amount = Number(body.amount);
+  const amount = grossAmount(body); // GROSS amount (AMOUNT_FIELD, default "amount")
   const rawMessage = cleanText(body.message, 180);
 
   if (!transactionId || !Number.isSafeInteger(amount) || amount <= 0) {
@@ -245,6 +286,29 @@ export default async function handler(req, res) {
   // a staging smoke test must never write into production (defence in depth: production uses other secrets too)
   if (process.env.VERCEL_ENV === "production" && /^smoke-/i.test(transactionId)) {
     return reply(res, 200, { ok: true, ignored: "test transaction" });
+  }
+
+  // TEST webhook: alert only, never counted (see TEST_SCRIPT above)
+  if (isTestWebhook(body, transactionId)) {
+    if (process.env.VERCEL_ENV === "production" && process.env.ALLOW_TEST_WEBHOOKS !== "1") {
+      return reply(res, 200, { ok: true, ignored: "test webhook (production)" });
+    }
+    const now = Date.now();
+    const row = JSON.stringify({
+      id: transactionId, name: donorName, amount,
+      message: rawMessage.replace(CODE_TOKEN_ALL, " ").replace(/\s+/g, " ").trim(),
+      receivedAt: now, test: true
+    });
+    try {
+      const r = await redis.eval(TEST_SCRIPT, ["bb:testfeed", `bb:testseen:${transactionId}`],
+        [String(now), row, String(TEST_TTL_SECONDS), String(now - TEST_TTL_SECONDS * 1000), String(TEST_MAX)]);
+      const status = Array.isArray(r) ? String(r[0]) : "error";
+      if (status === "error") return reply(res, 500, { error: "Test storage has a wrong type" });
+      return reply(res, 200, { ok: true, test: true, [status]: true });
+    } catch (e) {
+      console.error("Test webhook storage error:", String(e?.message || e).slice(0, 80));
+      return reply(res, 500, { error: "Could not store test webhook" });
+    }
   }
 
   const codeHash = linkCodeHash(rawMessage);

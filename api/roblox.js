@@ -369,6 +369,16 @@ export default async function handler(req, res) {
       [min, String(PAGE_LIMIT), String(TOP_SCAN), String(HISTORY_LIMIT), String(TOP50)]);
     if (!Array.isArray(feedResult) || String(feedResult[0]) !== "ok") throw new Error("feed keys have a wrong type");
     const [, rows, top, hist, oldest, count, rank] = feedResult;
+    // TEST webhooks (alert only, never counted): last 15 minutes, newer than the client's window
+    let tests = [];
+    try {
+      const testMin = Math.max(Math.floor(minValue) || 0, Date.now() - 15 * 60000);
+      const tr = await redis.zrange("bb:testfeed", testMin, "+inf", { byScore: true });
+      tests = (tr || []).map((t) => { try { return JSON.parse(String(t)); } catch { return null; } })
+        .filter((t) => t && t.test === true).slice(-20);
+    } catch (e) {
+      console.error("Test feed error:", String(e?.message || e).slice(0, 80));
+    }
 
     const donations = [];
     let lastScore = null;
@@ -450,6 +460,7 @@ export default async function handler(req, res) {
     return reply(res, 200, {
       ok: true,
       apiVersion: 3,
+      apiRevision: "3.1",
       env: process.env.VERCEL_ENV || "local",
       dbFingerprint: dbFingerprint(),
       serverTime: Date.now(),
@@ -459,7 +470,8 @@ export default async function handler(req, res) {
       truncated,
       leaderboard,
       top50,
-      history
+      history,
+      tests
     });
   } catch (error) {
     console.error("Roblox feed error:", String(error?.message || error).slice(0, 120));
