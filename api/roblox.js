@@ -15,6 +15,20 @@ import { lookupUsernames, refreshUsers } from "../lib/roblox-users.js";
 // NOT required for the leaderboard or for ROYAL.
 // Upstash REST rule: every key a Lua script touches is passed in KEYS.
 const redis = Redis.fromEnv({ automaticDeserialization: false });
+// HGETALL shape differs by client setting: with automaticDeserialization:false Upstash returns a flat array
+// [field, value, field, value, ...] and [] for a missing key; with deserialization it returns an object or null.
+// Normalise both to a plain object, or null when the hash is missing / empty. Read-only.
+function hashObject(raw) {
+  if (raw == null) return null;
+  if (Array.isArray(raw)) {
+    if (raw.length === 0) return null;
+    const pairs = [];
+    for (let i = 0; i + 1 < raw.length; i += 2) pairs.push([String(raw[i]), raw[i + 1] == null ? raw[i + 1] : String(raw[i + 1])]);
+    return Object.fromEntries(pairs);
+  }
+  if (typeof raw === "object") return Object.keys(raw).length ? raw : null;
+  return null;
+}
 
 const PAGE_LIMIT = 100;
 const TOP_LIMIT = 10;
@@ -302,7 +316,7 @@ async function resolvePendingWork() {
     const ids = ((await redis.zrange("bb:rbx:pending", 0, RESOLVE_BATCH - 1)) || []).map(String);
     if (!ids.length) return;
     const txs = [];
-    for (const id of ids) txs.push([id, await redis.hgetall(`bb:tx:${id}`)]);
+    for (const id of ids) txs.push([id, hashObject(await redis.hgetall(`bb:tx:${id}`))]);
     const cands = txs.map(([, h]) => h && h.status === "pending" && h.cand).filter(Boolean);
     const found = cands.length ? await lookupUsernames(redis, cands) : new Map();
     for (const [id, h] of txs) {

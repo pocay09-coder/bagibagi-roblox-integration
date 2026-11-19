@@ -7,6 +7,23 @@
 import { Redis } from "@upstash/redis";
 
 const redis = Redis.fromEnv({ automaticDeserialization: false });
+// HGETALL shape differs by client setting: with automaticDeserialization:false Upstash returns a flat array
+// [field, value, field, value, ...] and [] for a missing key; with deserialization it returns an object or null.
+// Normalise both to a plain object, or null when the hash is missing / empty. Read-only.
+function hashObject(raw) {
+  if (raw == null) return null;
+  if (Array.isArray(raw)) {
+    if (raw.length === 0) return null;
+    const pairs = [];
+    for (let i = 0; i + 1 < raw.length; i += 2) pairs.push([String(raw[i]), raw[i + 1] == null ? raw[i + 1] : String(raw[i + 1])]);
+    return Object.fromEntries(pairs);
+  }
+  if (typeof raw === "object") return Object.keys(raw).length ? raw : null;
+  return null;
+}
+async function hgetallObj(key) {
+  return hashObject(await redis.hgetall(key));
+}
 async function scanAll(match) {
   const keys = [];
   let cursor = "0";
@@ -25,7 +42,7 @@ for (const k of await scanAll("bb:processed:*")) {
   else if (v.startsWith("pending|")) markers.pending.push(k.slice("bb:processed:".length));
   else markers.other++;
 }
-const avatar = (await redis.hgetall("bb:avatar")) || {};
+const avatar = (await hgetallObj("bb:avatar")) || {};
 let brokenLinks = 0;
 for (const [identityKey, uid] of Object.entries(avatar)) {
   const members = (await redis.smembers(`bb:avatar:user:${uid}`)).map(String);
@@ -34,18 +51,14 @@ for (const [identityKey, uid] of Object.entries(avatar)) {
 const top = await redis.zrange("bb:donors", 0, -1, { withScores: true });
 let missingProfiles = 0;
 for (let i = 0; i < top.length; i += 2) {
-  if (!(await redis.hgetall(`bb:donor:${top[i]}`))) missingProfiles++;
+  if (!(await hgetallObj(`bb:donor:${top[i]}`))) missingProfiles++;
 }
 // v3 Gold Donation: bb:rank must equal the sum of the ledger bb:tx:* per member; PENDING bookkeeping must match
 const ledgerSum = new Map();
 const pendingPerMember = new Map();
 let ledgerRows = 0, ledgerPending = 0;
 for (const k of await scanAll("bb:tx:*")) {
-  const raw = await redis.hgetall(k);
-const h = Array.isArray(raw) ? Object.fromEntries(
-  Array.from({ length: Math.floor(raw.length / 2) },
-    (_, i) => [String(raw[i * 2]), raw[i * 2 + 1]])
-) : raw;
+  const h = await hgetallObj(k);
   if (!h) continue;
   ledgerRows++;
   const amt = Number(h.amount) || 0;
@@ -64,10 +77,10 @@ for (let i = 0; i < rank.length; i += 2) {
 for (const [m, v] of ledgerSum) if (v > 0 && !rankMembers.has(m)) rankMismatch++;
 const pendingSet = (await redis.zrange("bb:rbx:pending", 0, -1)).map(String);
 let pendingBad = 0;
-for (const id of pendingSet) { const h = await redis.hgetall(`bb:tx:${id}`); if (!h || h.status !== "pending") pendingBad++; }
+for (const id of pendingSet) { const h = await hgetallObj(`bb:tx:${id}`); if (!h || h.status !== "pending") pendingBad++; }
 if (pendingSet.length !== ledgerPending) pendingBad++;
 for (const [m, n] of pendingPerMember) {
-  const h = await redis.hgetall(`bb:rk:${m}`);
+  const h = await hgetallObj(`bb:rk:${m}`);
   if (!h || Number(h.pending || 0) !== n) pendingBad++;
 }
 console.log(`transaction markers: v1=${markers.v1} done=${markers.done} pending=${markers.pending.length} other=${markers.other}`);

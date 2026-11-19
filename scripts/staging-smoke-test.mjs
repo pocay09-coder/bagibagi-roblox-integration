@@ -1,4 +1,4 @@
-// AFTERBEAT BagiBagi backend v3 - smoke test for STAGING (Vercel Preview + SEPARATE Upstash database).
+// AFTERBEAT BagiBagi backend v3.1 - smoke test for STAGING (Vercel Preview + SEPARATE Upstash database).
 // Sends signed FAKE webhooks (transaction ids "smoke-...") and writes test data, so it refuses to run unless:
 //   * the flag --i-am-using-a-staging-database is given
 //   * the URL is not the known production domain
@@ -117,5 +117,19 @@ check(`username "${MATCH_USER}" found on Roblox -> USERNAME_MATCHED with UserId 
 check("two donations for the same username are added up under one UserId", acct && acct.total >= 2000 && (g.body.top50 || []).filter((e) => e.userId === acct.userId).length === 1);
 check("unknown name -> still counted in Top 50 as UNMATCHED, no UserId", un && (un.identity === "UNMATCHED" || un.identity === "PENDING") && un.userId === null && un.total === 700);
 check("ROYAL data: only found accounts in ranks 1-30, tag '#N ROYAL'", (g.body.top50 || []).every((e) => e.royal ? (e.userId > 0 && e.rank <= 30 && e.royalTag === `#${e.rank} ROYAL`) : e.royalTag === null));
+
+// ---- v3.1 test webhook (2): alert only, never counted ----
+if (probe.body.apiRevision === "3.1") {
+  const tid = `test-${run}`;
+  const tbody = { transaction_id: tid, name: `Smoke ${run}`, amount: 1234, message: "tes", test: true, created_at: new Date().toISOString() };
+  r = await hook(tbody);
+  g = await feed({ since: String(Date.now() - 60000) });
+  check("test webhook -> only in tests[] (for the [TEST] alert), not in donations / history / Top 50",
+    r.status === 200 && r.body.test === true && (g.body.tests || []).some((t) => t.id === tid) && !JSON.stringify([g.body.donations, g.body.history, g.body.top50]).includes(tid));
+  r = await hook(tbody);
+  check("the same test webhook again = duplicate (one alert)", r.status === 200 && r.body.duplicate === true);
+} else {
+  console.log(`SKIP test-webhook checks: backend is v${probe.body.apiRevision || "3.0"} (deploy v3.1 for test webhooks)`);
+}
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

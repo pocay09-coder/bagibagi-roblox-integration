@@ -8,6 +8,20 @@ import { Redis } from "@upstash/redis";
 import { writeFileSync } from "node:fs";
 
 const redis = Redis.fromEnv({ automaticDeserialization: false });
+// HGETALL shape differs by client setting: with automaticDeserialization:false Upstash returns a flat array
+// [field, value, field, value, ...] and [] for a missing key; with deserialization it returns an object or null.
+// Normalise both to a plain object, or null when the hash is missing / empty. Read-only.
+function hashObject(raw) {
+  if (raw == null) return null;
+  if (Array.isArray(raw)) {
+    if (raw.length === 0) return null;
+    const pairs = [];
+    for (let i = 0; i + 1 < raw.length; i += 2) pairs.push([String(raw[i]), raw[i + 1] == null ? raw[i + 1] : String(raw[i + 1])]);
+    return Object.fromEntries(pairs);
+  }
+  if (typeof raw === "object") return Object.keys(raw).length ? raw : null;
+  return null;
+}
 const API = String(process.env.ROBLOX_USERS_API_TEST_ONLY || "https://users.roblox.com").replace(/\/+$/, ""); // override = local tests only
 const out = process.argv[2] || "migration-report";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -28,7 +42,7 @@ async function scanAll(match) {
 // what v3 already counted per old key
 const v3PerLegacy = new Map();
 for (const k of await scanAll("bb:tx:*")) {
-  const h = await redis.hgetall(k);
+  const h = hashObject(await redis.hgetall(k));
   if (h && h.legacy) v3PerLegacy.set(h.legacy, (v3PerLegacy.get(h.legacy) || 0) + (Number(h.amount) || 0));
 }
 const donors = await redis.zrange("bb:donors", 0, -1, { withScores: true });
@@ -36,7 +50,7 @@ const rows = [];
 for (let i = 0; i < donors.length; i += 2) {
   const key = String(donors[i]);
   const total = Number(donors[i + 1]) || 0;
-  const prof = (await redis.hgetall(`bb:donor:${key}`)) || {};
+  const prof = hashObject(await redis.hgetall(`bb:donor:${key}`)) || {};
   const type = key.startsWith("uid:") ? "account(code)" : key.startsWith("id:") ? "donor-id" : "name";
   const historical = Math.max(0, total - (v3PerLegacy.get(key) || 0));
   rows.push({ legacyKey: key, type, name: String(prof.name || ""), legacyTotal: total, countedByV3: v3PerLegacy.get(key) || 0, historical,

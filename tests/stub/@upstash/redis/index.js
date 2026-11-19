@@ -50,7 +50,9 @@ end
 `;
 async function cmd(...a) { const r = await raw(a.map(String)); if (r instanceof RespError) throw new Error(r.message); return r; }
 export class Redis {
-  static fromEnv() { return new Redis(); }
+  // Mirrors @upstash/redis: with { automaticDeserialization: false } (what the backend uses) results come back raw
+  constructor(opts = {}) { this.rawResults = opts?.automaticDeserialization === false; }
+  static fromEnv(opts) { return new Redis(opts); }
   async eval(script, keys, args) {
     stats.evals++;
     if (faults.beforeEval) await faults.beforeEval(script, keys, args);
@@ -74,7 +76,8 @@ export class Redis {
   async zincrby(k, n, m) { return cmd("ZINCRBY", k, n, m); }
   async hset(k, obj) { return cmd("HSET", k, ...Object.entries(obj).flat()); }
   async lrange(k, a, b) { return cmd("LRANGE", k, a, b); }
-  async hgetall(k) { const r = await cmd("HGETALL", k); if (!r.length) return null; const o = {}; for (let i = 0; i < r.length; i += 2) o[r[i]] = r[i + 1]; return o; }
+  // raw mode: flat array [field, value, ...] and [] for a missing key (exactly like Upstash); otherwise object / null
+  async hgetall(k) { const r = await cmd("HGETALL", k); if (this.rawResults) return r; if (!r.length) return null; const o = {}; for (let i = 0; i < r.length; i += 2) o[r[i]] = r[i + 1]; return o; }
   async zrange(k, a, b, o = {}) {
     const args = ["ZRANGE", k, a, b];
     if (o.byScore) args.push("BYSCORE");

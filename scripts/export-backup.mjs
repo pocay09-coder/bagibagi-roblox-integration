@@ -6,6 +6,20 @@ import { Redis } from "@upstash/redis";
 import { writeFileSync } from "node:fs";
 
 const redis = Redis.fromEnv({ automaticDeserialization: false });
+// HGETALL shape differs by client setting: with automaticDeserialization:false Upstash returns a flat array
+// [field, value, field, value, ...] and [] for a missing key; with deserialization it returns an object or null.
+// Normalise both, so a hash is saved as { field: value } (Object.fromEntries keeps every field name). Read-only.
+function hashObject(raw) {
+  if (raw == null) return null;
+  if (Array.isArray(raw)) {
+    if (raw.length === 0) return null;
+    const pairs = [];
+    for (let i = 0; i + 1 < raw.length; i += 2) pairs.push([String(raw[i]), raw[i + 1] == null ? raw[i + 1] : String(raw[i + 1])]);
+    return Object.fromEntries(pairs);
+  }
+  if (typeof raw === "object") return Object.keys(raw).length ? raw : null;
+  return null;
+}
 const keys = [];
 let cursor = "0";
 do {
@@ -20,7 +34,7 @@ for (const key of keys) {
   if (type === "string") value = await redis.get(key);
   else if (type === "list") value = await redis.lrange(key, 0, -1);
   else if (type === "zset") value = await redis.zrange(key, 0, -1, { withScores: true });
-  else if (type === "hash") value = await redis.hgetall(key);
+  else if (type === "hash") value = hashObject(await redis.hgetall(key)) || {};
   else if (type === "set") value = await redis.smembers(key);
   out.push({ key, type, ttl: Number(await redis.ttl(key)), value });
 }

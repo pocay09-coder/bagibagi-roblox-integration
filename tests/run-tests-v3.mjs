@@ -51,7 +51,7 @@ const apiServer = http.createServer((req, res) => {
 await new Promise((r) => apiServer.listen(API_PORT, r));
 
 const redisSrv = spawn("redis-server", ["--port", String(PORT), "--save", "", "--appendonly", "no"], { stdio: "ignore" });
-const { raw, stats } = await import("@upstash/redis");
+const { raw, stats, faults } = await import("@upstash/redis");
 for (let i = 0; i < 50; i++) { try { if ((await raw(["PING"])) === "PONG") break; } catch {} await new Promise((r) => setTimeout(r, 100)); }
 const logs = [];
 const out = console.log.bind(console);
@@ -254,5 +254,118 @@ check("V29 old fields unchanged for current Roblox clients (donations, leaderboa
 check("V30 no Lua script touched an undeclared key", stats.undeclared === 0, `undeclared=${stats.undeclared}`);
 check("V31 no secrets / codes in logs", !logs.join("\n").includes(lc) && !logs.join("\n").includes("v3-link-key"));
 
+
+// ---------- 5. v3.1 TEST webhooks + gross amount ----------
+await flush();
+await hook(tx("pocay88", 10000)); // one real donation as reference
+const keysBefore = (await raw(["KEYS", "*"])).filter((k) => !k.startsWith("bb:rbx:")).sort().join(",");
+const rankBefore = await rankSum();
+const tw = (id, amount, extra = {}) => ({ transaction_id: id, name: "Tes Donatur", amount, message: "halo AFB-ABCD-EFGH", mediaShareUrl: "", created_at: "", ...extra });
+r = await hook(tw("t-flag-1", 25000, { test: true }));
+check("T1 signed test webhook (test:true) accepted as TEST", r.body.ok === true && r.body.test === true && r.body.accepted === true);
+let g2 = (await feed()).body;
+const t1row = (g2.tests || []).find((t) => t.id === "t-flag-1");
+check("T1 GET tests[] carries it (amount, name, test flag, code removed from message)", t1row && t1row.amount === 25000 && t1row.test === true && t1row.name === "Tes Donatur" && !String(t1row.message).includes("AFB"));
+check("T1 NOT in donations / history / top50 / leaderboard", !JSON.stringify([g2.donations, g2.history, g2.top50, g2.leaderboard]).includes("t-flag-1"));
+const keysAfter = (await raw(["KEYS", "*"])).filter((k) => !k.startsWith("bb:rbx:") && k !== "bb:testfeed" && !k.startsWith("bb:testseen:")).sort().join(",");
+check("T1 no ledger / processed marker / rank / donor / history / link key written", keysAfter === keysBefore && (await rankSum()) === rankBefore && (await raw(["EXISTS", "bb:tx:t-flag-1"])) === 0 && (await raw(["EXISTS", "bb:processed:t-flag-1"])) === 0);
+r = await hook(tw("t-flag-1", 25000, { test: true }));
+check("T2 the same test again = duplicate (one alert only)", r.body.duplicate === true && (g2 = (await feed()).body, (g2.tests || []).filter((t) => t.id === "t-flag-1").length === 1));
+r = await hook(tw("test-prefix-1", 5000));
+check("T3 transaction_id 'test-...' (outside production) = TEST", r.body.test === true && (await raw(["EXISTS", "bb:tx:test-prefix-1"])) === 0);
+for (const k of ["is_test", "isTest"]) { r = await hook(tw("t-" + k, 1000, { [k]: true })); check(`T3 flag ${k}: true = TEST`, r.body.test === true); }
+r = await hook(tw("t-string-flag", 1000, { test: "true" }));
+check("T3 test: \"true\" (string) is NOT a test flag -> counted as a normal donation", r.body.accepted === true && r.body.test === undefined && (await raw(["EXISTS", "bb:tx:t-string-flag"])) === 1);
+process.env.VERCEL_ENV = "production";
+r = await hook(tw("t-prod-1", 9000, { test: true }));
+check("T4 production: test webhook ignored, nothing stored", r.body.ignored && (await raw(["ZSCORE", "bb:testfeed", "x"])) === null && !((await feed()).body.tests || []).some((t) => t.id === "t-prod-1"));
+r = await hook(tw("test-real-id-1", 4000));
+check("T4 production: an id starting with 'test-' WITHOUT a test flag is a REAL donation (never dropped)", r.body.accepted === true && (await raw(["EXISTS", "bb:tx:test-real-id-1"])) === 1);
+process.env.ALLOW_TEST_WEBHOOKS = "1";
+r = await hook(tw("t-prod-allowed", 9000, { test: true }));
+check("T4 production + ALLOW_TEST_WEBHOOKS=1: accepted as TEST only", r.body.test === true && (await raw(["EXISTS", "bb:tx:t-prod-allowed"])) === 0);
+delete process.env.ALLOW_TEST_WEBHOOKS; delete process.env.VERCEL_ENV;
+await raw(["ZADD", "bb:testfeed", String(Date.now() - 16 * 60000), JSON.stringify({ id: "t-old", amount: 1, test: true })]);
+check("T5 tests older than 15 minutes are not delivered", !((await feed()).body.tests || []).some((t) => t.id === "t-old"));
+{ const rr = mkRes(); await rb({ method: "GET", headers: { "x-api-key": "v3-feed-key" }, query: { since: String(Date.now() + 60000) } }, rr);
+  check("T5 a client whose window starts after the test does not get it again (since cursor)", rr.code === 200 && !(rr.body.tests || []).some((t) => t.id === "t-flag-1")); }
+// gross amount
+process.env.AMOUNT_FIELD = "gross_amount";
+r = await hook({ ...tx("pocay88", 9500), gross_amount: 10000 });
+let txh = await raw(["HGET", "bb:tx:v3-" + n, "amount"]);
+check("G1 AMOUNT_FIELD=gross_amount: the GROSS field is counted, not 'amount'", r.body.accepted === true && txh === "10000", txh);
+r = await hook({ ...tx("pocay88", 9500), gross_amount: "20000" });
+txh = await raw(["HGET", "bb:tx:v3-" + n, "amount"]);
+check("G1 a numeric string is accepted", txh === "20000");
+process.env.AMOUNT_FIELD = "data.gross";
+r = await hook({ ...tx("pocay88", 1), data: { gross: 30000 } });
+txh = await raw(["HGET", "bb:tx:v3-" + n, "amount"]);
+check("G1 dotted path (data.gross) works", txh === "30000");
+process.env.AMOUNT_FIELD = "bad field;drop";
+r = await hook(tx("pocay88", 4000));
+txh = await raw(["HGET", "bb:tx:v3-" + n, "amount"]);
+check("G2 invalid AMOUNT_FIELD falls back to 'amount'", txh === "4000");
+process.env.AMOUNT_FIELD = "gross_amount";
+r = await hook(tx("pocay88", 4000));
+check("G2 gross field missing -> rejected (never counts the net amount by mistake)", r.code === 400);
+delete process.env.AMOUNT_FIELD;
+process.env.LOG_WEBHOOK_KEYS = "1";
+const logged = [];
+const origLog = console.log; console.log = (...a) => logged.push(a.join(" "));
+await hook({ ...tx("Nama Rahasia", 10000, "pesan rahasia"), net_amount: 9500, fee: 500 });
+console.log = origLog;
+delete process.env.LOG_WEBHOOK_KEYS;
+const lj = logged.join("\n");
+check("G3 LOG_WEBHOOK_KEYS logs amount-like numbers to find the gross field, never names / messages", lj.includes("amount=10000") && lj.includes("net_amount=9500") && lj.includes("fee=500") && !lj.includes("Rahasia") && !lj.includes("rahasia"));
+
+// ---------- 6. review fix: token-owned locks with compare-and-delete ----------
+await flush();
+const { withLock } = rbMod.__locks;
+let ran = false;
+let okL = await withLock("bb:test:lock", 20, async () => { ran = true; check("L1 while working, the lock holds a random token (not a fixed value)", /^[0-9a-f-]{36}$/.test(String(await raw(["GET", "bb:test:lock"])))); });
+check("L1 owner runs the work and releases its own lock", okL === true && ran && (await raw(["EXISTS", "bb:test:lock"])) === 0);
+await raw(["SET", "bb:test:lock", "token-of-B", "EX", "20"]);
+ran = false;
+okL = await withLock("bb:test:lock", 20, async () => { ran = true; });
+check("L2 lock held by someone else: no work, the other lock is untouched", okL === false && !ran && (await raw(["GET", "bb:test:lock"])) === "token-of-B");
+await raw(["DEL", "bb:test:lock"]);
+okL = await withLock("bb:test:lock", 20, async () => {
+  // A runs longer than its TTL: its lock expires and B takes the lock while A is still working
+  await raw(["DEL", "bb:test:lock"]);
+  await raw(["SET", "bb:test:lock", "token-of-B", "EX", "20"]);
+});
+check("L3 an OLD holder whose lock expired never deletes the NEW holder's lock", (await raw(["GET", "bb:test:lock"])) === "token-of-B");
+await raw(["DEL", "bb:test:lock"]);
+let threw = false;
+try { await withLock("bb:test:lock", 20, async () => { throw new Error("work failed"); }); } catch { threw = true; }
+check("L4 work throws: the error is passed on and the lock is still released", threw && (await raw(["EXISTS", "bb:test:lock"])) === 0);
+faults.beforeEval = async (script) => { if (script.includes("redis.call('DEL', KEYS[1])") && script.includes("GET")) throw new Error("network"); };
+okL = await withLock("bb:test:lock", 20, async () => {});
+faults.beforeEval = null;
+const ttlLeft = await raw(["TTL", "bb:test:lock"]);
+check("L5 release fails (network): no crash, the lock simply expires by its TTL", okL === true && ttlLeft > 0 && ttlLeft <= 20, `ttl=${ttlLeft}`);
+await raw(["DEL", "bb:test:lock"]);
+// end to end through GET: pending resolution + 24h refresh with the real lock keys
+api.mode = "500";
+await hook(tx("player01", 4000));
+api.mode = "ok"; await clearBackoff();
+await raw(["SET", "bb:rbx:lock", "foreign-token", "EX", "20"]);
+await feed();
+check("L6 GET while another server holds bb:rbx:lock: pending stays pending, foreign lock untouched",
+  (await raw(["ZCARD", "bb:rbx:pending"])) === 1 && (await raw(["GET", "bb:rbx:lock"])) === "foreign-token");
+await raw(["DEL", "bb:rbx:lock"]);
+await feed();
+check("L6 next GET takes the lock, resolves the pending donation and releases its own lock",
+  (await raw(["ZCARD", "bb:rbx:pending"])) === 0 && (await raw(["EXISTS", "bb:rbx:lock"])) === 0 && entry(await top(), (e) => e.userId === 3001).total === 4000);
+await raw(["HSET", "bb:rk:u:3001", "refreshedAt", "1"]);
+await raw(["SET", "bb:rbx:refreshlock", "foreign-refresh", "EX", "30"]);
+await feed();
+check("L7 24h refresh skipped while another server holds bb:rbx:refreshlock, foreign lock untouched",
+  (await raw(["HGET", "bb:rk:u:3001", "refreshedAt"])) === "1" && (await raw(["GET", "bb:rbx:refreshlock"])) === "foreign-refresh");
+await raw(["DEL", "bb:rbx:refreshlock"]);
+await feed();
+check("L7 next GET refreshes and releases its own refresh lock",
+  Number(await raw(["HGET", "bb:rk:u:3001", "refreshedAt"])) > 1 && (await raw(["EXISTS", "bb:rbx:refreshlock"])) === 0);
+check("T6 v3.1 scripts touched no undeclared key either", stats.undeclared === 0, `undeclared=${stats.undeclared}`);
 out(`\n${pass} passed, ${fail} failed`);
 apiServer.close(); redisSrv.kill(); process.exit(fail ? 1 : 0);
