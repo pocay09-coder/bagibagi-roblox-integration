@@ -1,0 +1,7 @@
+.env.staging.local
+node_modules/
+.env*
+backup-*.json
+backup-before-*/
+migration-report.json
+migration-report.csv
