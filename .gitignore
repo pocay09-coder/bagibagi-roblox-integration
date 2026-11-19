@@ -1,2 +1,5 @@
 .env.staging.local
 node_modules/
+.env*
+backup-*.json
+backup-before-*/

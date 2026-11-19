@@ -1,5 +1,5 @@
 import { Redis } from "@upstash/redis";
-import { createHash, createHmac, randomInt, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import { lookupUsernames, refreshUsers } from "../lib/roblox-users.js";
 
 // AFTERBEAT feed for Roblox game servers, v3 (backward compatible with v2.1 / v1 clients).
@@ -268,11 +268,37 @@ function dbFingerprint() {
   }
 }
 
+// ===== short Redis locks (v3.1 review fix) =====
+// Each holder writes its OWN random token. Release = compare-and-delete in Lua: a process whose lock already expired
+// (it ran longer than the TTL) can never delete a lock that a newer process holds now. The work under these locks is
+// idempotent anyway (REATTRIBUTE / MARK_UNMATCHED re-check the ledger), the lock only avoids duplicate effort.
+const UNLOCK_SCRIPT = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+return 0
+`;
+async function withLock(key, ttlSeconds, fn) {
+  const token = randomUUID();
+  const got = await redis.set(key, token, { nx: true, ex: ttlSeconds });
+  if (!got) return false; // someone else is working
+  try {
+    await fn();
+  } finally {
+    try {
+      await redis.eval(UNLOCK_SCRIPT, [key], [token]);
+    } catch (e) {
+      // not released: it expires by itself after ttlSeconds
+      console.error("Lock release error:", String(e?.message || e).slice(0, 80));
+    }
+  }
+  return true;
+}
+
 // finish PENDING lookups (one server at a time; failures just leave them pending)
 async function resolvePending() {
-  const got = await redis.set("bb:rbx:lock", String(Date.now()), { nx: true, ex: 20 });
-  if (!got) return;
-  try {
+  await withLock("bb:rbx:lock", 20, resolvePendingWork);
+}
+async function resolvePendingWork() {
+  {
     const ids = ((await redis.zrange("bb:rbx:pending", 0, RESOLVE_BATCH - 1)) || []).map(String);
     if (!ids.length) return;
     const txs = [];
@@ -295,8 +321,6 @@ async function resolvePending() {
         await redis.eval(MARK_UNMATCHED_SCRIPT, [`bb:tx:${id}`, "bb:rbx:pending", fromHash], [id, from]);
       }
     }
-  } finally {
-    await redis.del("bb:rbx:lock");
   }
 }
 
@@ -305,9 +329,7 @@ async function refreshStale(entries) {
   const now = Date.now();
   const stale = entries.filter((e) => e._account && (!e._refreshedAt || now - e._refreshedAt > REFRESH_AFTER_MS)).map((e) => e._account);
   if (!stale.length) return;
-  const got = await redis.set("bb:rbx:refreshlock", "1", { nx: true, ex: 30 });
-  if (!got) return;
-  try {
+  await withLock("bb:rbx:refreshlock", 30, async () => {
     const r = await refreshUsers(redis, stale);
     for (const e of entries) {
       if (!e._account || !r.has(e._account)) continue;
@@ -320,9 +342,7 @@ async function refreshStale(entries) {
         e._banned = true;
       }
     }
-  } finally {
-    await redis.del("bb:rbx:refreshlock");
-  }
+  });
 }
 
 export default async function handler(req, res) {
@@ -480,4 +500,5 @@ export default async function handler(req, res) {
 }
 
 // exported for the local test suite only (constants, no side effects)
-export const __scripts = { CREATE_SCRIPT, REATTRIBUTE_SCRIPT, MARK_UNMATCHED_SCRIPT };
+export const __scripts = { CREATE_SCRIPT, REATTRIBUTE_SCRIPT, MARK_UNMATCHED_SCRIPT, UNLOCK_SCRIPT };
+export const __locks = { withLock }; // tests only
